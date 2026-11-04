@@ -58,6 +58,36 @@ retry() {
     done
 }
 
+# run-concurrently runs the given commands at the same time, prints the
+# output of each one once all of them have finished, and fails if any of them
+# failed. Each argument has the form "<name>=<command>", where the command is
+# run through bash -c and the name labels its output.
+run-concurrently() {
+    local names=()
+    local pids=()
+    local entry
+    for entry in "$@"; do
+        local name="${entry%%=*}"
+        local command="${entry#*=}"
+        log-debug "starting ${name}..."
+        bash -c "${command}" > "${name}.log" 2>&1 &
+        names+=("${name}")
+        pids+=($!)
+    done
+
+    local failed=()
+    local i
+    for i in "${!names[@]}"; do
+        if ! wait "${pids[$i]}"; then
+            failed+=("${names[$i]}")
+        fi
+        log-debug "output of ${names[$i]}:"
+        cat "${names[$i]}.log"
+    done
+
+    [ ${#failed[@]} -eq 0 ] || fail-now "failed: ${failed[*]}"
+}
+
 docker-up() {
     if [ $# -eq 0 ]; then
         log-debug "bringing up services..."
@@ -90,6 +120,26 @@ docker-wait-for-healthy() {
     done
 
     fail-now "timed out waiting for ${ctr_name} to start"
+}
+
+fetch-spire-bundle() {
+    local namespace=$1
+    local deployment=$2
+    ./bin/kubectl -n "${namespace}" exec "deployment/${deployment}" -- \
+        /opt/spire/bin/spire-server bundle show -format spiffe \
+        | jq -S '.keys |= sort_by(tostring)'
+}
+
+assert-spire-bundle-unchanged() {
+    local before=$1
+    local after=$2
+    local context=$3
+    if [ -z "${before}" ] || [ -z "${after}" ]; then
+        fail-now "Failed to fetch trust bundle ${context}"
+    fi
+    if [ "${before}" != "${after}" ]; then
+        fail-now "Trust bundle changed ${context} <E2><80><94> KeyManager did not recover the persisted keys"
+    fi
 }
 
 docker-stop() {
@@ -233,15 +283,28 @@ check-synced-entry() {
 }
 
 check-svid-count() {
+  SVIDTYPE="$1"
   MAXCHECKS=50
   CHECKINTERVAL=1
 
+  case "$SVIDTYPE" in
+    x509)
+      JQFIELD=".cachedX509SvidsCount"
+      ;;
+    jwt)
+      JQFIELD=".cachedJwtSvidsCount"
+      ;;
+    *)
+      fail-now "unknown SVID type \"$SVIDTYPE\""
+      ;;
+  esac
+
   for ((i=1;i<=MAXCHECKS;i++)); do
-    log-info "check SVID count on agent debug endpoint ($((i)) of $MAXCHECKS max)..."
-    COUNT=$(docker compose exec -T "$1" /opt/spire/conf/agent/debugclient -testCase "printDebugPage" | jq '.svidsCount')
-    log-info "SVID Count: ${COUNT}"
-    if [ "$COUNT" -eq "$2" ]; then
-      log-info "SVID count of $COUNT from cache matches the expected count of $2"
+    log-info "check ${SVIDTYPE} SVID count on agent debug endpoint ($((i)) of $MAXCHECKS max)..."
+    COUNT=$(docker compose exec -T "$2" /opt/spire/conf/agent/debugclient -testCase "printDebugPage" | jq "$JQFIELD")
+    log-info "${SVIDTYPE} SVID Count: ${COUNT}"
+    if [ "$COUNT" -eq "$3" ]; then
+      log-info "SVID count of $COUNT from cache matches the expected count of $3"
       break
     fi
     sleep "${CHECKINTERVAL}"
@@ -276,15 +339,28 @@ build-mashup-image() {
     ENVOY_VERSION=$1
     ENVOY_IMAGE_TAG="${ENVOY_VERSION}-latest"
 
+    # The entrypoint runs the agent in the background and Envoy in the
+    # foreground, so the container lives as long as Envoy does. Nothing is
+    # installed into the Envoy image, which keeps the build off the network
+    # apart from pulling the base image.
+    cat > envoy-agent-entrypoint.sh <<'EOF'
+#!/bin/sh
+/opt/spire/bin/spire-agent run -config /opt/spire/conf/agent/agent.conf &
+# Envoy backs off failed SDS requests, so start it once the agent can hand out the workload SVID.
+for i in $(seq 60); do
+    /opt/spire/bin/spire-agent api fetch x509 -socketPath /opt/shared/agent.sock && break
+    sleep 1
+done
+exec /usr/local/bin/envoy -l debug -c /opt/envoy/conf/envoy.yaml
+EOF
+    chmod +x envoy-agent-entrypoint.sh
+
     cat > Dockerfile <<EOF
 FROM spire-agent:latest-local as spire-agent
 FROM envoyproxy/envoy:${ENVOY_IMAGE_TAG} AS envoy-agent-mashup
 COPY --from=spire-agent /opt/spire/bin/spire-agent /opt/spire/bin/spire-agent
-RUN apt-get update
-RUN apt-get install -y dumb-init
-RUN apt-get install -y supervisor
-COPY conf/supervisord.conf /etc/
-ENTRYPOINT ["/usr/bin/dumb-init", "supervisord", "--nodaemon", "--configuration", "/etc/supervisord.conf"]
+COPY envoy-agent-entrypoint.sh /opt/envoy/entrypoint.sh
+ENTRYPOINT ["/opt/envoy/entrypoint.sh"]
 CMD []
 EOF
 

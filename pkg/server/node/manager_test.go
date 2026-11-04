@@ -152,14 +152,12 @@ func (s *ManagerSuite) TestPruning() {
 
 func (s *ManagerSuite) setupAndRunManager(ctx context.Context, expiredFor time.Duration) func() {
 	s.m = NewManager(ManagerConfig{
-		Clock:     s.clock,
-		DataStore: s.ds,
-		Log:       s.log,
-		Metrics:   s.metrics,
-		PruneArgs: PruneArgs{
-			ExpiredFor:             expiredFor,
-			IncludeNonReattestable: false,
-		},
+		Clock:                  s.clock,
+		DataStore:              s.ds,
+		Log:                    s.log,
+		Metrics:                s.metrics,
+		ExpiredFor:             expiredFor,
+		IncludeNonReattestable: false,
 	})
 
 	// override without jitter
@@ -170,6 +168,11 @@ func (s *ManagerSuite) setupAndRunManager(ctx context.Context, expiredFor time.D
 	go func() {
 		errCh <- s.m.Run(ctx)
 	}()
+
+	// The tests advance the mock clock to trigger pruning. A tick fires only
+	// on tickers that already exist, so wait for the manager to create its
+	// ticker before returning.
+	s.clock.WaitForTicker(time.Second, "manager did not create its prune ticker")
 	return func() {
 		cancel()
 		s.Require().NoError(<-errCh)

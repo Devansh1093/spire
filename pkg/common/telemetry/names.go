@@ -151,6 +151,9 @@ const (
 	// AgentVersion is the version of the SPIRE agent
 	AgentVersion = "agent_version"
 
+	// AllowedIdentities tags the allowed identities of a verifier
+	AllowedIdentities = "allowed_identities"
+
 	// Attempt tags some count of attempts
 	Attempt = "attempt"
 
@@ -213,6 +216,12 @@ const (
 	// CertFilePath tags a certificate file path used for TLS connections.
 	CertFilePath = "cert_file_path"
 
+	// CertificateExpiration tags a certificate expiration time
+	CertificateExpiration = "certificate_expiration"
+
+	// ChainExpiration tags a certificate chain expiration time
+	ChainExpiration = "chain_expiration"
+
 	// KeyID tags a key ID
 	KeyID = "key_id"
 
@@ -247,6 +256,9 @@ const (
 
 	// Count tags some basic count; should be used with other tags and clear messaging to add clarity
 	Count = "count"
+
+	// CurrentChainExpiration tags the current certificate chain expiration time
+	CurrentChainExpiration = "current_chain_expiration"
 
 	// CreatedAt tags registration entry creation date
 	CreatedAt = "created_at"
@@ -456,6 +468,9 @@ const (
 	// PluginType tags type of some plugin
 	PluginType = "plugin_type"
 
+	// PreparedChainExpiration tags a prepared certificate chain expiration time
+	PreparedChainExpiration = "prepared_chain_expiration"
+
 	// PodUID tags some pod UID, most likely for use in attestation
 	PodUID = "pod_uid"
 
@@ -620,6 +635,14 @@ const (
 	// with other tags to add clarity
 	TTL = "ttl"
 
+	// MaxTTL functionality related to a maximum time-to-live field; should be
+	// used with other tags to add clarity
+	MaxTTL = "max_ttl"
+
+	// MaxExpiration functionality related to a maximum expiration field; should
+	// be used with other tags to add clarity
+	MaxExpiration = "max_expiration"
+
 	// X509 SVID TTL functionality related to a time-to-live field for X509-SVIDs; should be used
 	// with other tags to add clarity
 	X509SVIDTTL = "x509_svid_ttl"
@@ -627,6 +650,10 @@ const (
 	// JWT SVID TTL functionality related to a time-to-live field for JWT-SVIDs; should be used
 	// with other tags to add clarity
 	JWTSVIDTTL = "jwt_svid_ttl"
+
+	// WIT SVID TTL functionality related to a time-to-live field for WIT-SVIDs; should be used
+	// with other tags to add clarity
+	WITSVIDTTL = "wit_svid_ttl"
 
 	// Type tags a type
 	Type = "type"
@@ -655,6 +682,15 @@ const (
 
 	// VersionInfo tags some version information
 	VersionInfo = "version_info"
+
+	// WITAuthorityExpiresAt tags a WIT Authority expiration
+	WITAuthorityExpiresAt = "wit_authority_expires_at"
+
+	// WITAuthorityKeyID tags a WIT authority key ID
+	WITAuthorityKeyID = "wit_authority_key_id"
+
+	// WITAuthorityPublicKeySHA256 tags a WIT Authority public key
+	WITAuthorityPublicKeySHA256 = "wit_authority_public_key_sha256"
 
 	// WITKeys tags some count or list of WIT Keys. Should NEVER provide the actual keys, use
 	// Key IDs instead.

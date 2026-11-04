@@ -13,6 +13,7 @@ import (
 	"github.com/spiffe/spire/pkg/agent/manager/cache"
 	"github.com/spiffe/spire/pkg/common/telemetry"
 	telemetry_agent "github.com/spiffe/spire/pkg/common/telemetry/agent"
+	"github.com/spiffe/spire/pkg/common/util"
 	"github.com/spiffe/spire/pkg/common/x509util"
 	"github.com/spiffe/spire/proto/spire/common"
 )
@@ -40,6 +41,8 @@ type Record struct {
 type cachedRecord struct {
 	entry *common.RegistrationEntry
 	svid  *cache.X509SVID
+	// svidEntry is the entry the SVID, if any, was issued for.
+	svidEntry *common.RegistrationEntry
 
 	revision     int64
 	handled      int64
@@ -172,6 +175,14 @@ func (c *Cache) UpdateEntries(update *cache.UpdateEntries, checkSVID func(*commo
 			record.revision++
 		}
 
+		// Selectors pick the store destination; a new destination must not
+		// get the SVID issued for a different entry.
+		if record.svid != nil &&
+			!util.EqualsSelectors(record.svidEntry.Selectors, newEntry.Selectors) &&
+			record.svid.InvalidatedBy(record.svidEntry, newEntry) {
+			record.svid = nil
+		}
+
 		// TODO: in case where entry is updated may we not increment revision and just add it to stale?
 		// Then stale will be taken by sync and it will increment revision.
 		if checkSVID != nil && checkSVID(existingEntry, newEntry, record.svid) {
@@ -193,13 +204,13 @@ func (c *Cache) UpdateEntries(update *cache.UpdateEntries, checkSVID func(*commo
 	}
 }
 
-// UpdateSVIDs updates cache with latest SVIDs
-func (c *Cache) UpdateSVIDs(update *cache.UpdateSVIDs) {
+// UpdateX509SVIDs updates cache with latest SVIDs
+func (c *Cache) UpdateX509SVIDs(svids map[string]*cache.X509SVID) {
 	c.mtx.Lock()
 	defer c.mtx.Unlock()
 
 	// Add/update records for registration entries in the update
-	for entryID, svid := range update.X509SVIDs {
+	for entryID, svid := range svids {
 		record, existingEntry := c.records[entryID]
 		if !existingEntry {
 			c.c.Log.WithField(telemetry.RegistrationID, entryID).Error("Entry not found")
@@ -211,6 +222,7 @@ func (c *Cache) UpdateSVIDs(update *cache.UpdateSVIDs) {
 		}
 
 		record.svid = svid
+		record.svidEntry = record.entry
 		// Increment revision since record changed
 		record.revision++
 		log := c.c.Log.WithFields(logrus.Fields{
@@ -252,7 +264,7 @@ func (c *Cache) TaintX509SVIDs(ctx context.Context, taintedX509Authorities []*x5
 		}
 	}
 
-	telemetry_agent.AddCacheManagerExpiredSVIDsSample(c.c.Metrics, telemetry_agent.CacheTypeSVIDStore, float32(taintedSVIDs))
+	telemetry_agent.AddCacheManagerExpiredSVIDsSample(c.c.Metrics, telemetry_agent.CacheTypeSVIDStore, telemetry_agent.SVIDTypeX509, float32(taintedSVIDs))
 	c.c.Log.WithField(telemetry.TaintedX509SVIDs, taintedSVIDs).Info("Tainted X.509 SVIDs")
 }
 

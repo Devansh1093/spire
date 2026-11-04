@@ -3,13 +3,11 @@ package cli
 import (
 	"context"
 	stdlog "log"
-	"os"
-	"slices"
-	"strings"
 
 	"github.com/mitchellh/cli"
 	"github.com/spiffe/spire/cmd/spire-server/cli/agent"
 	"github.com/spiffe/spire/cmd/spire-server/cli/bundle"
+	"github.com/spiffe/spire/cmd/spire-server/cli/debug"
 	"github.com/spiffe/spire/cmd/spire-server/cli/entry"
 	"github.com/spiffe/spire/cmd/spire-server/cli/federation"
 	"github.com/spiffe/spire/cmd/spire-server/cli/healthcheck"
@@ -23,7 +21,6 @@ import (
 	"github.com/spiffe/spire/cmd/spire-server/cli/validate"
 	"github.com/spiffe/spire/cmd/spire-server/cli/wit"
 	"github.com/spiffe/spire/cmd/spire-server/cli/x509"
-	"github.com/spiffe/spire/pkg/common/fflag"
 	"github.com/spiffe/spire/pkg/common/log"
 	"github.com/spiffe/spire/pkg/common/version"
 )
@@ -39,6 +36,9 @@ func (cc *CLI) Run(ctx context.Context, args []string) int {
 	c := cli.NewCLI("spire-server", version.Version())
 	c.Args = args
 	c.Commands = map[string]cli.CommandFactory{
+		"debug getinfo": func() (cli.Command, error) {
+			return debug.NewGetInfoCommand(), nil
+		},
 		"agent ban": func() (cli.Command, error) {
 			return agent.NewBanCommand(), nil
 		},
@@ -168,35 +168,14 @@ func (cc *CLI) Run(ctx context.Context, args []string) int {
 		"upstreamauthority revoke": func() (cli.Command, error) {
 			return upstreamauthority.NewRevokeCommand(), nil
 		},
+		"wit mint": func() (cli.Command, error) {
+			return wit.NewMintCommand(), nil
+		},
 	}
-
-	addCommandsEnabledByFFlags(c.Commands)
 
 	exitStatus, err := c.Run()
 	if err != nil {
 		stdlog.Println(err)
 	}
 	return exitStatus
-}
-
-// addCommandsEnabledByFFlags adds commands that are currently available only
-// through a feature flag.
-// Feature flags support through the fflag package in SPIRE Server is
-// designed to work only with the run command and the config file.
-// Since feature flags are intended to be used by developers of a specific
-// feature only, exposing them through command line arguments is not
-// convenient. Instead, we use the SPIRE_SERVER_FFLAGS environment variable
-// to read the configured SPIRE Server feature flags from the environment
-// when other commands may be enabled through feature flags.
-func addCommandsEnabledByFFlags(commands map[string]cli.CommandFactory) {
-	fflagsEnv := os.Getenv("SPIRE_SERVER_FFLAGS")
-	fflags := strings.Split(fflagsEnv, " ")
-
-	flagWITSVID := slices.Contains(fflags, string(fflag.FlagWITSVID))
-
-	if flagWITSVID {
-		commands["wit mint"] = func() (cli.Command, error) {
-			return wit.NewMintCommand(), nil
-		}
-	}
 }

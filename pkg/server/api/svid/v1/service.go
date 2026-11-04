@@ -423,6 +423,9 @@ func (s *Service) NewJWTSVID(ctx context.Context, req *svidv1.NewJWTSVIDRequest)
 
 func (s *Service) BatchNewWITSVID(ctx context.Context, req *svidv1.BatchNewWITSVIDRequest) (*svidv1.BatchNewWITSVIDResponse, error) {
 	log := rpccontext.Logger(ctx)
+	if s.isWITSVIDsDisabled() {
+		return nil, commonapi.MakeErr(log, codes.Unimplemented, "WIT functionality is disabled", nil)
+	}
 
 	if len(req.Params) == 0 {
 		return nil, commonapi.MakeErr(log, codes.InvalidArgument, "missing parameters", nil)
@@ -574,8 +577,7 @@ func (s *Service) newWITSVID(ctx context.Context, param *svidv1.NewWITSVIDParams
 			Algorithm: param.SigningAlgorithm,
 			Key:       publicKey,
 		},
-		// TODO: add WIT specific TTL (https://github.com/spiffe/spire/issues/6535)
-		TTL: time.Duration(entry.GetX509SvidTtl()) * time.Second,
+		TTL: time.Duration(entry.GetWitSvidTtl()) * time.Second,
 	})
 	if err != nil {
 		return &svidv1.BatchNewWITSVIDResponse_Result{
@@ -597,6 +599,7 @@ func (s *Service) newWITSVID(ctx context.Context, param *svidv1.NewWITSVIDParams
 			ExpiresAt: expiresAt.Unix(),
 			IssuedAt:  issuedAt.Unix(),
 		},
+		Status: commonapi.OK(),
 	}
 }
 

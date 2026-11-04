@@ -3,12 +3,11 @@ package sqlstore
 import (
 	"context"
 	"errors"
-	"fmt"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/jinzhu/gorm"
 	"github.com/spiffe/spire/pkg/server/datastore/sqlcommon"
 	"github.com/spiffe/spire/pkg/server/datastore/sqldriver/awsrds"
+	"github.com/spiffe/spire/pkg/server/datastore/sqldriver/azurerds"
 
 	// gorm postgres `cloudsql` dialect, for GCP Cloud SQL Proxy
 	_ "github.com/GoogleCloudPlatform/cloudsql-proxy/proxy/dialers/postgres"
@@ -27,28 +26,17 @@ func (p postgresDB) connect(ctx context.Context, cfg *sqlcommon.Configuration, i
 	var errOpen error
 	switch {
 	case cfg.DBTypeConfig.AWSPostgres != nil:
-		c, err := pgx.ParseConfig(connString)
-		if err != nil {
-			return nil, "", false, err
-		}
-		if c.Password != "" {
-			return nil, "", false, errors.New("invalid postgres configuration: password should not be set when using IAM authentication")
-		}
-
-		awsrdsConfig := &awsrds.Config{
-			Region:          cfg.DBTypeConfig.AWSPostgres.Region,
-			AccessKeyID:     cfg.DBTypeConfig.AWSPostgres.AccessKeyID,
-			SecretAccessKey: cfg.DBTypeConfig.AWSPostgres.SecretAccessKey,
-			Endpoint:        fmt.Sprintf("%s:%d", c.Host, c.Port),
-			DbUser:          c.User,
-			DriverName:      awsrds.PostgresDriverName,
-			ConnString:      connString,
-		}
-		dsn, err := awsrdsConfig.FormatDSN()
+		dsn, err := sqlcommon.BuildAWSPostgresDSN(cfg, isReadOnly)
 		if err != nil {
 			return nil, "", false, err
 		}
 		db, errOpen = gorm.Open(awsrds.PostgresDriverName, dsn)
+	case cfg.DBTypeConfig.AzurePostgres != nil:
+		dsn, err := sqlcommon.BuildAzurePostgresDSN(cfg, isReadOnly)
+		if err != nil {
+			return nil, "", false, err
+		}
+		db, errOpen = gorm.Open(azurerds.PostgresDriverName, dsn)
 	default:
 		db, errOpen = gorm.Open("postgres", connString)
 	}

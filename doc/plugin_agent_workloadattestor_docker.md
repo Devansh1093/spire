@@ -14,7 +14,8 @@ then querying the container runtime API (Docker by default, or Podman when detec
 | docker_host                    | The location of the Docker Engine API endpoint (Windows only)                                                                               | "npipe:////./pipe/docker_engine"         |
 | sigstore                       | Sigstore options. See [Sigstore options](#sigstore-options). When set, enables verification of container image signatures and attestations. |                                          |
 | use_new_container_locator      | If true, enables the new container locator algorithm that has support for cgroups v2                                                        | true                                     |
-| verbose_container_locator_logs | If true, enables verbose logging of mountinfo and cgroup information used to locate containers                                              | false                                    |
+| verbose_container_locator_logs | If true, enables verbose logging of cgroup information used to locate containers                                                            | false                                    |
+| use_rootless_podman            | If true, enables rootless Podman attestation via a per-user socket from the workload cgroup; pair with unix:uid/user selectors (Unix)       | false                                    |
 
 A sample configuration:
 
@@ -27,21 +28,22 @@ A sample configuration:
 
 ## Podman support (Unix)
 
-The plugin supports Podman workloads, including rootless Podman in multi-user hosts.
+The plugin supports Podman workloads, including rootless Podman on multi-user hosts as an opt-in.
 
 At attestation time, the plugin inspects the workload cgroup path:
 
-- If a Podman cgroup path is detected and includes a user slice (`/user-<uid>.slice/`), SPIRE treats the workload as rootless Podman and calls the Podman API using `podman_socket_path_template` with `<uid>` substituted into `%d`.
+- If a Podman cgroup path is detected and includes a user slice (`/user-<uid>.slice/`), the workload is a rootless Podman container. It is attested only when `use_rootless_podman` is set to `true`, in which case SPIRE calls the Podman API using `podman_socket_path_template` with `<uid>` substituted into `%d`. When `use_rootless_podman` is `false` (the default), rootless Podman workloads are not attested by this plugin.
 - If a Podman cgroup path is detected but no user slice UID is present, SPIRE uses `podman_socket_path` (rootful Podman).
 - If no Podman cgroup path is detected, SPIRE uses `docker_socket_path` (Docker).
 
-This per-workload socket selection avoids routing rootless Podman workloads through a single global daemon socket.
+The per-user socket lives in the workload owner's own runtime directory (`/run/user/<uid>/`), which that user controls, so a rootless Podman workload can present arbitrary container labels for its own UID. For this reason `use_rootless_podman` is opt-in, and when it is enabled the resulting Podman selectors should be paired with `unix:uid` or `unix:user` selectors (produced by the `unix` workload attestor) so that a workload cannot obtain an identity scoped to a different user.
 
 Example rootless customization:
 
 ```hcl
 WorkloadAttestor "docker" {
     plugin_data {
+        use_rootless_podman = true
         podman_socket_path_template = "unix:///custom/user/%d/podman.sock"
     }
 }
@@ -56,11 +58,13 @@ This feature extends the `docker` workload attestor with the ability to validate
 | Option                 | Description                                                                                                                                                                                                                                                       |
 |------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `allowed_identities`   | Maps OIDC Provider URIs to lists of allowed subjects. Supports regular expressions patterns. Defaults to empty. If unspecified, signatures from any issuer are accepted. (eg. `"https://accounts.google.com" = ["subject1@example.com","subject2@example.com"]`). |
+| `public_key_paths`     | Lists paths to PEM encoded public keys that verify key-based signatures, such as `cosign sign --key`. A signature verified by any listed key is accepted. Cannot be combined with `allowed_identities`. Defaults to empty.                                        |
 | `skipped_images`       | Lists image IDs to exclude from Sigstore signature verification. For these images, no Sigstore selectors will be generated. Defaults to an empty list.                                                                                                            |
 | `rekor_url`            | Specifies the Rekor URL for transparency log verification. Default is the public Rekor instance [https://rekor.sigstore.dev](https://rekor.sigstore.dev).                                                                                                         |
 | `ignore_tlog`          | If set to true, bypasses the transparency log verification and the selectors based on the Rekor bundle are not generated.                                                                                                                                         |
 | `ignore_attestations`  | If set to true, bypasses the image attestations verification and the selector `image-attestations:verified` is not generated.                                                                                                                                     |
 | `ignore_sct`           | If set to true, bypasses the Signed Certificate Timestamp (SCT) verification.                                                                                                                                                                                     |
+| `registry_referrers`   | If set to true, looks up signatures through the OCI 1.1 referrers API first and falls back to the tag scheme. Attestations always use the tag scheme. Defaults to false.                                                                                          |
 | `registry_credentials` | Maps each registry URL to its corresponding authentication credentials. Example: `{"docker.io": {"username": "user", "password": "pass"}}`.                                                                                                                       |
 
 #### Custom CA Roots
@@ -91,12 +95,15 @@ Sigstore enabled selectors (available when configured to use `sigstore`)
 | docker:image-signature-value                  | The base64 encoded value of the signature (eg. `k8s:image-signature-content:MEUCIQCyem8Gcr0sPFMP7fTXazCN57NcN5+MjxJw9Oo0x2eM+AIgdgBP96BO1Te/NdbjHbUeb0BUye6deRgVtQEv5No5smA=`)                                                            |
 | docker:image-signature-subject                | The OIDC principal that signed the image (e.g., `k8s:image-signature-subject:spirex@example.com`)                                                                                                                                         |
 | docker:image-signature-issuer                 | The OIDC issuer of the signature (e.g., `k8s:image-signature-issuer:https://accounts.google.com`)                                                                                                                                         |
+| docker:image-signature-public-key-sha256      | The hex encoded SHA-256 of the DER encoded public key, for each listed key that verified a signature.                                                                                                                                     |
 | docker:image-signature-log-id                 | A unique LogID for the Rekor transparency log entry (eg. `k8s:image-signature-log-id:c0d23d6ad406973f9559f3ba2d1ca01f84147d8ffc5b8445c224f98b95918123`)                                                                                   |
 | docker:image-signature-log-index              | The log index for the Rekor transparency log entry (eg. `k8s:image-signature-log-index:105695637`)                                                                                                                                        |
 | docker:image-signature-integrated-time        | The time (in Unix timestamp format) when the image signature was integrated into the signature transparency log (eg. `k8s:image-signature-integrated-time:1719237832`)                                                                    |
 | docker:image-signature-signed-entry-timestamp | The base64 encoded signed entry (signature over the logID, logIndex, body and integratedTime) (eg. `k8s:image-signature-integrated-time:MEQCIDP77vB0/MEbR1QKZ7Ol8PgFwGEEvnQJiv5cO7ATDYRwAiB9eBLYZjclxRNaaNJVBdQfP9Y8vGVJjwdbisme2cKabc`)  |
 
-If `ignore_tlog` is set to `true`, the selectors based on the Rekor bundle (`-log-id`, `-log-index`, `-integrated-time`, and `-signed-entry-timestamp`) are not generated.
+If `ignore_tlog` is set to `true`, the selectors based on the Rekor bundle (`-log-id`, `-log-index`, `-integrated-time`, and `-signed-entry-timestamp`) are not generated. They are also not generated for a signature without a Rekor bundle, which cosign checks through an online Rekor lookup.
+
+With `public_key_paths` set, the subject and issuer selectors are not generated, and attestations are accepted when any listed key verifies them. The `-public-key-sha256` value of a key is the output of `openssl pkey -pubin -in key.pub -outform DER | sha256sum`.
 
 ## Container ID CGroup Matchers
 

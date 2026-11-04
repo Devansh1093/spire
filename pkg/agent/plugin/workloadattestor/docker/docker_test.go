@@ -4,13 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sort"
 	"testing"
 	"time"
 
 	"github.com/hashicorp/go-hclog"
 	"github.com/moby/moby/api/types/container"
-	"github.com/moby/moby/api/types/image"
 	dockerclient "github.com/moby/moby/client"
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
 	"github.com/spiffe/spire/pkg/agent/common/sigstore"
@@ -160,6 +161,14 @@ func TestDockerConfig(t *testing.T) {
 	// Make sure sigstore caches things in memory instead of trying
 	// to cache them to some directory.
 	t.Setenv("SIGSTORE_NO_CACHE", "true")
+	keyPath := filepath.Join(t.TempDir(), "cosign.pub")
+	require.NoError(t, os.WriteFile(keyPath, []byte(`-----BEGIN PUBLIC KEY-----
+MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEviJ8lqUgtqWzruk4EQn9vu/L7sdf
+PfUXSEDR2XADpiECNp+cvuunA23H20EHF08s7HFPn6yycViqdfaisrsA3A==
+-----END PUBLIC KEY-----
+`), 0o600))
+	invalidKeyPath := filepath.Join(t.TempDir(), "invalid.pub")
+	require.NoError(t, os.WriteFile(invalidKeyPath, []byte(" "), 0o600))
 
 	for _, tt := range []struct {
 		name               string
@@ -192,6 +201,26 @@ func TestDockerConfig(t *testing.T) {
 						registry_password = "pass"
 					}`,
 			sigstoreConfigured: true,
+		},
+		{
+			name:        "public key sigstore configuration",
+			trustDomain: "example.org",
+			config: fmt.Sprintf(`
+					sigstore {
+						public_key_paths = [%q]
+						ignore_tlog = true
+					}`, keyPath),
+			sigstoreConfigured: true,
+		},
+		{
+			name:        "invalid public key is rejected",
+			trustDomain: "example.org",
+			config: fmt.Sprintf(`
+					sigstore {
+						public_key_paths = [%q]
+					}`, invalidKeyPath),
+			expectCode: codes.InvalidArgument,
+			expectMsg:  fmt.Sprintf("sigstore public_key_paths: failed to parse public key %q", invalidKeyPath),
 		},
 		{
 			name:        "bad hcl",
@@ -431,7 +460,7 @@ func (d dockerNoRepoDigests) ContainerInspect(_ context.Context, _ string, _ doc
 }
 
 func (dockerNoRepoDigests) ImageInspect(_ context.Context, _ string, _ ...dockerclient.ImageInspectOption) (dockerclient.ImageInspectResult, error) {
-	return dockerclient.ImageInspectResult{InspectResponse: image.InspectResponse{ID: "sha256:abc"}}, nil
+	return dockerclient.ImageInspectResult{ID: "sha256:abc"}, nil
 }
 func TestSigstore_NoRepoDigests_Fatal(t *testing.T) {
 	d := dockerNoRepoDigests{
@@ -542,8 +571,8 @@ func (f fakeContainer) ContainerInspect(_ context.Context, containerID string, _
 }
 
 func (f fakeContainer) ImageInspect(_ context.Context, imageID string, _ ...dockerclient.ImageInspectOption) (dockerclient.ImageInspectResult, error) {
-	return dockerclient.ImageInspectResult{InspectResponse: image.InspectResponse{
-		ID: imageID, RepoDigests: []string{testImageID}}}, nil
+	return dockerclient.ImageInspectResult{
+		ID: imageID, RepoDigests: []string{testImageID}}, nil
 }
 
 type fakeSigstoreVerifier struct {

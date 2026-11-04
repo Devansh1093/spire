@@ -98,6 +98,7 @@ type Endpoints struct {
 	EntryFetcherPruneEventsTask  func(context.Context) error
 	CertificateReloadTask        func(context.Context) error
 	AuditLogEnabled              bool
+	AuditLogExcludeAgentSync     bool
 	ProxyProtocolTrustedCIDRs    []string
 	AuthPolicyEngine             *authpolicy.Engine
 	AdminIDs                     []spiffeid.ID
@@ -227,6 +228,7 @@ func New(ctx context.Context, c Config) (*Endpoints, error) {
 		EntryFetcherPruneEventsTask:  pruneEventsTask,
 		CertificateReloadTask:        certificateReloadTask,
 		AuditLogEnabled:              c.AuditLogEnabled,
+		AuditLogExcludeAgentSync:     c.AuditLogExcludeAgentSync,
 		ProxyProtocolTrustedCIDRs:    c.ProxyProtocolTrustedCIDRs,
 		AuthPolicyEngine:             c.AuthPolicyEngine,
 		AdminIDs:                     c.AdminIDs,
@@ -375,14 +377,37 @@ func (e *Endpoints) runTCPServer(ctx context.Context, server *grpc.Server) error
 // wrapListenerWithProxyProtocol wraps a net.Listener with PROXY protocol
 // support, restricting header acceptance to the given trusted CIDRs.
 func wrapListenerWithProxyProtocol(l net.Listener, trustedCIDRs []string) (net.Listener, error) {
-	policy, err := proxyproto.ConnStrictWhiteListPolicy(trustedCIDRs)
+	policy, err := proxyproto.PolicyFromRanges(trustedCIDRs, proxyproto.USE, proxyproto.REJECT)
 	if err != nil {
 		return nil, err
 	}
 	return &proxyproto.Listener{
-		Listener:   l,
-		ConnPolicy: policy,
+		Listener:       l,
+		ConnPolicy:     policy,
+		ValidateHeader: validateProxyHeader,
 	}, nil
+}
+
+// validateProxyHeader ensures a PROXY protocol header can only replace the
+// connection's source address with a TCP address.
+func validateProxyHeader(h *proxyproto.Header) error {
+	if h.Command.IsLocal() {
+		// LOCAL headers carry no addresses; the real peer address is used.
+		return nil
+	}
+
+	switch h.TransportProtocol {
+	case proxyproto.TCPv4, proxyproto.TCPv6, proxyproto.UNSPEC:
+	default:
+		return fmt.Errorf("unsupported PROXY protocol transport protocol %#x", byte(h.TransportProtocol))
+	}
+
+	if h.SourceAddr != nil {
+		if _, ok := h.SourceAddr.(*net.TCPAddr); !ok {
+			return fmt.Errorf("unsupported PROXY protocol source address type %T", h.SourceAddr)
+		}
+	}
+	return nil
 }
 
 // runLocalAccess will start a grpc server to be accessed locally
@@ -470,7 +495,7 @@ func (e *Endpoints) getTLSConfig(ctx context.Context) func(*tls.ClientHelloInfo)
 		spiffeTLSConfig.VerifyPeerCertificate = e.serverSpiffeVerificationFunc(bundleSrc)
 		spiffeTLSConfig.SessionTicketsDisabled = true
 
-		err := tlspolicy.ApplyPolicy(spiffeTLSConfig, e.TLSPolicy)
+		err := tlspolicy.ApplyPolicy(spiffeTLSConfig, e.TLSPolicy, tlspolicy.WithServerTLSConfig())
 		if err != nil {
 			return nil, err
 		}
@@ -482,7 +507,7 @@ func (e *Endpoints) getTLSConfig(ctx context.Context) func(*tls.ClientHelloInfo)
 func (e *Endpoints) makeInterceptors() (grpc.UnaryServerInterceptor, grpc.StreamServerInterceptor) {
 	log := e.Log.WithField(telemetry.SubsystemName, "api")
 
-	return middleware.Interceptors(Middleware(log, e.Metrics, e.DataStore, e.nodeCache, e.MaxAttestedNodeInfoStaleness, clock.New(), e.RateLimit, e.AuthPolicyEngine, e.AuditLogEnabled, e.AdminIDs))
+	return middleware.Interceptors(Middleware(log, e.Metrics, e.DataStore, e.nodeCache, e.MaxAttestedNodeInfoStaleness, clock.New(), e.RateLimit, e.AuthPolicyEngine, e.AuditLogEnabled, e.AuditLogExcludeAgentSync, e.AdminIDs))
 }
 
 func (e *Endpoints) triggerListeningHook() {

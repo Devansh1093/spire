@@ -1,6 +1,7 @@
 package run
 
 import (
+	"crypto/tls"
 	"io"
 	"os"
 	"path"
@@ -9,15 +10,17 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hashicorp/hcl"
 	"github.com/hashicorp/hcl/hcl/ast"
 	"github.com/sirupsen/logrus"
 	"github.com/sirupsen/logrus/hooks/test"
 	"github.com/spiffe/spire/pkg/agent"
 	agentbroker "github.com/spiffe/spire/pkg/agent/broker"
 	"github.com/spiffe/spire/pkg/agent/client"
+	"github.com/spiffe/spire/pkg/agent/manager"
 	"github.com/spiffe/spire/pkg/agent/workloadkey"
 	"github.com/spiffe/spire/pkg/common/log"
-	"github.com/spiffe/spire/pkg/common/telemetry"
+	"github.com/spiffe/spire/pkg/common/tlspolicy"
 	"github.com/spiffe/spire/test/spiretest"
 	"github.com/spiffe/spire/test/util"
 	"github.com/stretchr/testify/assert"
@@ -35,6 +38,7 @@ type newAgentConfigCase struct {
 	msg                string
 	expectError        bool
 	requireErrorPrefix string
+	env                map[string]string
 	input              func(*Config)
 	logOptions         func(t *testing.T) []log.Option
 	test               func(*testing.T, *agent.Config)
@@ -638,6 +642,11 @@ func TestMergeInput(t *testing.T) {
 	}
 }
 
+var localXDSBootstrapEnv = map[string]string{
+	"GRPC_XDS_BOOTSTRAP":        "",
+	"GRPC_XDS_BOOTSTRAP_CONFIG": `{"xds_servers":[{"server_uri":"localhost:18000","channel_creds":[{"type":"insecure"}]}]}`,
+}
+
 func TestNewAgentConfig(t *testing.T) {
 	cases := []newAgentConfigCase{
 		{
@@ -648,6 +657,78 @@ func TestNewAgentConfig(t *testing.T) {
 			},
 			test: func(t *testing.T, c *agent.Config) {
 				require.Equal(t, "dns:///192.168.1.1:1337", c.ServerAddress)
+			},
+		},
+		{
+			msg: "use_xds produces an xds target from server_address",
+			env: localXDSBootstrapEnv,
+			input: func(c *Config) {
+				c.Agent.ServerAddress = "spire-server"
+				c.Agent.ServerPort = 0
+				c.Agent.Experimental.UseXDS = true
+			},
+			test: func(t *testing.T, c *agent.Config) {
+				require.Equal(t, "xds:///spire-server", c.ServerAddress)
+			},
+		},
+		{
+			msg: "use_xds rejects server_port",
+			env: localXDSBootstrapEnv,
+			input: func(c *Config) {
+				c.Agent.ServerAddress = "spire-server"
+				c.Agent.ServerPort = 1337
+				c.Agent.Experimental.UseXDS = true
+			},
+			expectError:        true,
+			requireErrorPrefix: "server_port cannot be used with use_xds",
+			test: func(t *testing.T, c *agent.Config) {
+				require.Nil(t, c)
+			},
+		},
+		{
+			msg: "use_xds rejects server_address gRPC would truncate",
+			env: localXDSBootstrapEnv,
+			input: func(c *Config) {
+				c.Agent.ServerAddress = "spire-server?x=1"
+				c.Agent.ServerPort = 0
+				c.Agent.Experimental.UseXDS = true
+			},
+			expectError:        true,
+			requireErrorPrefix: "invalid server_address: invalid xDS listener name",
+			test: func(t *testing.T, c *agent.Config) {
+				require.Nil(t, c)
+			},
+		},
+		{
+			msg: "use_xds rejects server_load_balancing_config",
+			env: localXDSBootstrapEnv,
+			input: func(c *Config) {
+				c.Agent.ServerAddress = "spire-server"
+				c.Agent.ServerPort = 0
+				c.Agent.Experimental.UseXDS = true
+				c.Agent.Experimental.ServerLoadBalancingConfig = `[ { "pick_first": {} } ]`
+			},
+			expectError:        true,
+			requireErrorPrefix: "server_load_balancing_config cannot be used with use_xds",
+			test: func(t *testing.T, c *agent.Config) {
+				require.Nil(t, c)
+			},
+		},
+		{
+			msg: "use_xds rejects insecure remote xDS server",
+			env: map[string]string{
+				"GRPC_XDS_BOOTSTRAP":        "",
+				"GRPC_XDS_BOOTSTRAP_CONFIG": `{"xds_servers":[{"server_uri":"xds.example.org:18000","channel_creds":[{"type":"insecure"}]}]}`,
+			},
+			input: func(c *Config) {
+				c.Agent.ServerAddress = "spire-server"
+				c.Agent.ServerPort = 0
+				c.Agent.Experimental.UseXDS = true
+			},
+			expectError:        true,
+			requireErrorPrefix: "invalid xDS configuration:",
+			test: func(t *testing.T, c *agent.Config) {
+				require.Nil(t, c)
 			},
 		},
 		{
@@ -998,6 +1079,25 @@ func TestNewAgentConfig(t *testing.T) {
 			},
 		},
 		{
+			msg: "health_checks check_interval is correctly parsed",
+			input: func(c *Config) {
+				c.HealthChecks.RawCheckInterval = "30s"
+			},
+			test: func(t *testing.T, c *agent.Config) {
+				require.Equal(t, 30*time.Second, c.HealthChecks.CheckInterval)
+			},
+		},
+		{
+			msg:         "invalid health_checks check_interval returns an error",
+			expectError: true,
+			input: func(c *Config) {
+				c.HealthChecks.RawCheckInterval = "b"
+			},
+			test: func(t *testing.T, c *agent.Config) {
+				require.Nil(t, c)
+			},
+		},
+		{
 			msg:         "invalid log_level returns an error",
 			expectError: true,
 			input: func(c *Config) {
@@ -1018,12 +1118,226 @@ func TestNewAgentConfig(t *testing.T) {
 			},
 		},
 		{
+			// not an OS specific case: unlike the signal based reopen, in
+			// process rotation works on every platform
+			msg: "log_file_rotation configures a self rotating log file",
+			input: func(c *Config) {
+				c.Agent.LogFile = filepath.Join(spiretest.TempDir(t), "agent.log")
+				c.Agent.LogFileRotation = &log.RotationConfig{MaxSizeMB: new(10), MaxFiles: new(3)}
+			},
+			test: func(t *testing.T, c *agent.Config) {
+				require.NotNil(t, c.Log)
+				require.NotNil(t, c.LogReopener)
+
+				l := c.Log.(*log.Logger)
+				// the temp dir cannot be removed on Windows while the log
+				// file is still open
+				t.Cleanup(func() { _ = l.Close() })
+
+				rotatable, ok := l.Out.(*log.RotatableFile)
+				require.True(t, ok, "expected a RotatableFile, got %T", l.Out)
+				require.FileExists(t, rotatable.Name())
+			},
+		},
+		{
+			msg: "log_file without log_file_rotation stays reopenable",
+			input: func(c *Config) {
+				c.Agent.LogFile = filepath.Join(spiretest.TempDir(t), "agent.log")
+			},
+			test: func(t *testing.T, c *agent.Config) {
+				require.NotNil(t, c.Log)
+				require.NotNil(t, c.LogReopener)
+
+				l := c.Log.(*log.Logger)
+				// the temp dir cannot be removed on Windows while the log
+				// file is still open
+				t.Cleanup(func() { _ = l.Close() })
+
+				require.IsType(t, &log.ReopenableFile{}, l.Out)
+			},
+		},
+		{
+			msg:                "log_file_rotation without log_file returns an error",
+			expectError:        true,
+			requireErrorPrefix: "log_file must be configured to use log_file_rotation",
+			input: func(c *Config) {
+				c.Agent.LogFileRotation = &log.RotationConfig{MaxSizeMB: new(10)}
+			},
+			test: func(t *testing.T, c *agent.Config) {
+				require.Nil(t, c)
+			},
+		},
+		{
+			msg:                "negative log_file_rotation max_size_mb returns an error",
+			expectError:        true,
+			requireErrorPrefix: "invalid log_file_rotation configuration: max_size_mb (-1) must not be negative",
+			input: func(c *Config) {
+				c.Agent.LogFile = "foo"
+				c.Agent.LogFileRotation = &log.RotationConfig{MaxSizeMB: new(-1)}
+			},
+			test: func(t *testing.T, c *agent.Config) {
+				require.Nil(t, c)
+			},
+		},
+		{
+			msg:                "negative log_file_rotation max_files returns an error",
+			expectError:        true,
+			requireErrorPrefix: "invalid log_file_rotation configuration: max_files (-1) must not be negative",
+			input: func(c *Config) {
+				c.Agent.LogFile = "foo"
+				c.Agent.LogFileRotation = &log.RotationConfig{MaxFiles: new(-1)}
+			},
+			test: func(t *testing.T, c *agent.Config) {
+				require.Nil(t, c)
+			},
+		},
+		{
 			msg: "sync_interval parses a duration",
 			input: func(c *Config) {
 				c.Agent.Experimental.SyncInterval = "2s45ms"
 			},
 			test: func(t *testing.T, c *agent.Config) {
 				require.EqualValues(t, 2045000000, c.SyncInterval)
+			},
+		},
+		{
+			msg: "server_load_balancing_config defaults to empty",
+			input: func(_ *Config) {
+			},
+			test: func(t *testing.T, c *agent.Config) {
+				require.Empty(t, c.ServerLoadBalancingConfig)
+			},
+		},
+		{
+			msg: "server_load_balancing_config is passed through",
+			input: func(c *Config) {
+				c.Agent.Experimental.ServerLoadBalancingConfig = `[ { "pick_first": {} } ]`
+			},
+			test: func(t *testing.T, c *agent.Config) {
+				require.Equal(t, `[ { "pick_first": {} } ]`, c.ServerLoadBalancingConfig)
+			},
+		},
+		{
+			msg:         "invalid server_load_balancing_config returns an error",
+			expectError: true,
+			input: func(c *Config) {
+				c.Agent.Experimental.ServerLoadBalancingConfig = `pick_first`
+			},
+			test: func(t *testing.T, c *agent.Config) {
+				require.Nil(t, c)
+			},
+		},
+		{
+			msg: "sync_retry_backoff defaults to nil",
+			input: func(_ *Config) {
+			},
+			test: func(t *testing.T, c *agent.Config) {
+				require.Nil(t, c.SyncRetryBackoff)
+			},
+		},
+		{
+			msg: "sync_retry_backoff is passed through",
+			input: func(c *Config) {
+				c.Agent.Experimental.SyncRetryBackoff = &syncRetryBackoffConfig{
+					MaxInterval:       "30s",
+					BackoffMultiplier: new(1.5),
+					Jitter:            new(0.0),
+				}
+			},
+			test: func(t *testing.T, c *agent.Config) {
+				require.Equal(t, &manager.SyncRetryBackoffConfig{
+					MaxInterval: 30 * time.Second,
+					Multiplier:  new(1.5),
+					Jitter:      new(0.0),
+				}, c.SyncRetryBackoff)
+			},
+		},
+		{
+			msg:                "invalid sync_retry_backoff max_interval returns an error",
+			expectError:        true,
+			requireErrorPrefix: "could not parse sync_retry_backoff.max_interval",
+			input: func(c *Config) {
+				c.Agent.Experimental.SyncRetryBackoff = &syncRetryBackoffConfig{MaxInterval: "moo"}
+			},
+			test: func(t *testing.T, c *agent.Config) {
+				require.Nil(t, c)
+			},
+		},
+		{
+			msg:                "zero sync_retry_backoff max_interval returns an error",
+			expectError:        true,
+			requireErrorPrefix: "sync_retry_backoff.max_interval (0s) must be greater than 0",
+			input: func(c *Config) {
+				c.Agent.Experimental.SyncRetryBackoff = &syncRetryBackoffConfig{MaxInterval: "0s"}
+			},
+			test: func(t *testing.T, c *agent.Config) {
+				require.Nil(t, c)
+			},
+		},
+		{
+			msg:                "negative sync_retry_backoff max_interval returns an error",
+			expectError:        true,
+			requireErrorPrefix: "sync_retry_backoff.max_interval (-1s) must be greater than 0",
+			input: func(c *Config) {
+				c.Agent.Experimental.SyncRetryBackoff = &syncRetryBackoffConfig{MaxInterval: "-1s"}
+			},
+			test: func(t *testing.T, c *agent.Config) {
+				require.Nil(t, c)
+			},
+		},
+		{
+			msg:                "sync_retry_backoff max_interval lower than the sync interval returns an error",
+			expectError:        true,
+			requireErrorPrefix: "effective sync_retry_backoff.max_interval (1s) must not be less than the sync interval (5s)",
+			input: func(c *Config) {
+				c.Agent.Experimental.SyncRetryBackoff = &syncRetryBackoffConfig{MaxInterval: "1s"}
+			},
+			test: func(t *testing.T, c *agent.Config) {
+				require.Nil(t, c)
+			},
+		},
+		{
+			msg:                "sync interval higher than the max interval it defaults to returns an error",
+			expectError:        true,
+			requireErrorPrefix: "effective sync_retry_backoff.max_interval (8m0s) must not be less than the sync interval (10m0s)",
+			input: func(c *Config) {
+				c.Agent.Experimental.SyncInterval = "10m"
+				c.Agent.Experimental.SyncRetryBackoff = &syncRetryBackoffConfig{}
+			},
+			test: func(t *testing.T, c *agent.Config) {
+				require.Nil(t, c)
+			},
+		},
+		{
+			msg: "sync_retry_backoff max_interval is compared against the configured sync interval",
+			input: func(c *Config) {
+				c.Agent.Experimental.SyncInterval = "500ms"
+				c.Agent.Experimental.SyncRetryBackoff = &syncRetryBackoffConfig{MaxInterval: "1s"}
+			},
+			test: func(t *testing.T, c *agent.Config) {
+				require.Equal(t, &manager.SyncRetryBackoffConfig{MaxInterval: time.Second}, c.SyncRetryBackoff)
+			},
+		},
+		{
+			msg:                "sync_retry_backoff backoff_multiplier lower than one returns an error",
+			expectError:        true,
+			requireErrorPrefix: "sync_retry_backoff.backoff_multiplier (0.50) must not be less than 1",
+			input: func(c *Config) {
+				c.Agent.Experimental.SyncRetryBackoff = &syncRetryBackoffConfig{BackoffMultiplier: new(0.5)}
+			},
+			test: func(t *testing.T, c *agent.Config) {
+				require.Nil(t, c)
+			},
+		},
+		{
+			msg:                "sync_retry_backoff jitter out of range returns an error",
+			expectError:        true,
+			requireErrorPrefix: "sync_retry_backoff.jitter (1.00) must be in the [0, 1) range",
+			input: func(c *Config) {
+				c.Agent.Experimental.SyncRetryBackoff = &syncRetryBackoffConfig{Jitter: new(1.0)}
+			},
+			test: func(t *testing.T, c *agent.Config) {
+				require.Nil(t, c)
 			},
 		},
 		{
@@ -1034,37 +1348,6 @@ func TestNewAgentConfig(t *testing.T) {
 			},
 			test: func(t *testing.T, c *agent.Config) {
 				require.Nil(t, c)
-			},
-		},
-		{
-			msg: "use_sync_authorized_entries logs deprecation alert",
-			input: func(c *Config) {
-				useSyncAuthorizedEntries := false
-				c.Agent.Experimental.UseSyncAuthorizedEntries = &useSyncAuthorizedEntries
-			},
-			logOptions: func(t *testing.T) []log.Option {
-				return []log.Option{
-					func(logger *log.Logger) error {
-						logger.SetOutput(io.Discard)
-						hook := test.NewLocal(logger.Logger)
-						t.Cleanup(func() {
-							spiretest.AssertLogsContainEntries(t, hook.AllEntries(), []spiretest.LogEntry{
-								{
-									Level:   logrus.WarnLevel,
-									Message: "The 'use_sync_authorized_entries' configuration is deprecated. The option to disable it will be removed in SPIRE 1.13.",
-									Data: logrus.Fields{
-										telemetry.Alert:     "true",
-										telemetry.AlertType: telemetry.DeprecatedConfigAlertType,
-									},
-								},
-							})
-						})
-						return nil
-					},
-				}
-			},
-			test: func(t *testing.T, c *agent.Config) {
-				require.False(t, c.UseSyncAuthorizedEntries)
 			},
 		},
 		{
@@ -1326,6 +1609,29 @@ func TestNewAgentConfig(t *testing.T) {
 			},
 		},
 		{
+			msg:   "TLS config is omitted by default",
+			input: func(c *Config) {},
+			test: func(t *testing.T, c *agent.Config) {
+				require.Nil(t, c.TLSPolicy.TLSCfg)
+			},
+		},
+		{
+			msg: "TLS config is configured",
+			input: func(c *Config) {
+				c.Agent.TLSConfig = &tlspolicy.TLSConfig{
+					MinTLSVersion:    "VersionTLS13",
+					CipherSuites:     []string{"TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256"},
+					CurvePreferences: []string{"X25519", "secp256r1"},
+				}
+			},
+			test: func(t *testing.T, c *agent.Config) {
+				require.NotNil(t, c.TLSPolicy.TLSCfg)
+				require.Equal(t, uint16(tls.VersionTLS13), c.TLSPolicy.TLSCfg.MinTLSVersion)
+				require.Nil(t, c.TLSPolicy.TLSCfg.CipherSuites)
+				require.Equal(t, []tls.CurveID{tls.X25519, tls.CurveP256}, c.TLSPolicy.TLSCfg.CurvePreferences)
+			},
+		},
+		{
 			msg: "jwt_svid_cache_hit_timeout sets the client timeout and logs warning",
 			input: func(c *Config) {
 				c.Agent.Experimental.JWTSVIDCacheHitTimeout = "10s"
@@ -1369,6 +1675,91 @@ func TestNewAgentConfig(t *testing.T) {
 			requireErrorPrefix: "jwt_svid_cache_hit_timeout (30s) must be less than 30s",
 			input: func(c *Config) {
 				c.Agent.Experimental.JWTSVIDCacheHitTimeout = "30s"
+			},
+			test: func(t *testing.T, ac *agent.Config) {
+				require.Nil(t, ac)
+			},
+		},
+		{
+			msg: "rpc_timeout is accepted and logs warning",
+			input: func(c *Config) {
+				c.Agent.Experimental.RPCTimeout = "10s"
+			},
+			logOptions: func(t *testing.T) []log.Option {
+				return []log.Option{
+					func(logger *log.Logger) error {
+						logger.SetOutput(io.Discard)
+						hook := test.NewLocal(logger.Logger)
+						t.Cleanup(func() {
+							spiretest.AssertLogsContainEntries(t, hook.AllEntries(), []spiretest.LogEntry{
+								{
+									Level:   logrus.WarnLevel,
+									Message: "The use of 'rpc_timeout' is experimental",
+								},
+							})
+						})
+						return nil
+					},
+				}
+			},
+			test: func(t *testing.T, ac *agent.Config) {
+				require.NotNil(t, ac)
+			},
+		},
+		{
+			msg:                "rpc_timeout returns an error if <= 0",
+			expectError:        true,
+			requireErrorPrefix: "rpc_timeout (0s) must be greater than 0",
+			input: func(c *Config) {
+				c.Agent.Experimental.RPCTimeout = "0s"
+			},
+			test: func(t *testing.T, ac *agent.Config) {
+				require.Nil(t, ac)
+			},
+		},
+		{
+			msg:                "rpc_timeout returns an error if invalid duration",
+			expectError:        true,
+			requireErrorPrefix: "could not parse rpc_timeout:",
+			input: func(c *Config) {
+				c.Agent.Experimental.RPCTimeout = "invalid"
+			},
+			test: func(t *testing.T, ac *agent.Config) {
+				require.Nil(t, ac)
+			},
+		},
+		{
+			msg: "max_bundle_workers is accepted and logs warning",
+			input: func(c *Config) {
+				c.Agent.Experimental.MaxBundleWorkers = 5
+			},
+			logOptions: func(t *testing.T) []log.Option {
+				return []log.Option{
+					func(logger *log.Logger) error {
+						logger.SetOutput(io.Discard)
+						hook := test.NewLocal(logger.Logger)
+						t.Cleanup(func() {
+							spiretest.AssertLogsContainEntries(t, hook.AllEntries(), []spiretest.LogEntry{
+								{
+									Level:   logrus.WarnLevel,
+									Message: "The use of 'max_bundle_workers' is experimental",
+								},
+							})
+						})
+						return nil
+					},
+				}
+			},
+			test: func(t *testing.T, ac *agent.Config) {
+				require.NotNil(t, ac)
+			},
+		},
+		{
+			msg:                "max_bundle_workers returns an error if < 1",
+			expectError:        true,
+			requireErrorPrefix: "max_bundle_workers (-1) must be greater than 0",
+			input: func(c *Config) {
+				c.Agent.Experimental.MaxBundleWorkers = -1
 			},
 			test: func(t *testing.T, ac *agent.Config) {
 				require.Nil(t, ac)
@@ -1431,15 +1822,17 @@ func TestNewAgentConfig(t *testing.T) {
 			},
 		},
 		{
-			msg: "ratelimit all six knobs are configurable",
+			msg: "ratelimit all eight knobs are configurable",
 			input: func(c *Config) {
-				a, b, d, e, f, g := 10, 20, 30, 40, 50, 60
+				a, b, d, e, f, g, h, i := 10, 20, 30, 40, 50, 60, 70, 80
 				c.Agent.Experimental.RateLimit.FetchX509SVID = &a
 				c.Agent.Experimental.RateLimit.FetchJWTSVID = &b
 				c.Agent.Experimental.RateLimit.FetchX509Bundles = &d
 				c.Agent.Experimental.RateLimit.FetchJWTBundles = &e
-				c.Agent.Experimental.RateLimit.StreamSecrets = &f
-				c.Agent.Experimental.RateLimit.FetchSecrets = &g
+				c.Agent.Experimental.RateLimit.FetchWITSVID = &f
+				c.Agent.Experimental.RateLimit.FetchWITBundles = &g
+				c.Agent.Experimental.RateLimit.StreamSecrets = &h
+				c.Agent.Experimental.RateLimit.FetchSecrets = &i
 			},
 			test: func(t *testing.T, ac *agent.Config) {
 				require.Equal(t, agent.WorkloadAPIRateLimitConfig{
@@ -1447,8 +1840,10 @@ func TestNewAgentConfig(t *testing.T) {
 					FetchJWTSVID:     20,
 					FetchX509Bundles: 30,
 					FetchJWTBundles:  40,
-					StreamSecrets:    50,
-					FetchSecrets:     60,
+					FetchWITSVID:     50,
+					FetchWITBundles:  60,
+					StreamSecrets:    70,
+					FetchSecrets:     80,
 				}, ac.WorkloadAPIRateLimit)
 			},
 		},
@@ -1469,6 +1864,28 @@ func TestNewAgentConfig(t *testing.T) {
 			input: func(c *Config) {
 				v := -1
 				c.Agent.Experimental.RateLimit.FetchJWTBundles = &v
+			},
+			test: func(t *testing.T, ac *agent.Config) {
+				require.Nil(t, ac)
+			},
+		},
+		{
+			msg:         "ratelimit fetch_wit_svid negative value returns an error",
+			expectError: true,
+			input: func(c *Config) {
+				v := -1
+				c.Agent.Experimental.RateLimit.FetchWITSVID = &v
+			},
+			test: func(t *testing.T, ac *agent.Config) {
+				require.Nil(t, ac)
+			},
+		},
+		{
+			msg:         "ratelimit fetch_wit_bundles negative value returns an error",
+			expectError: true,
+			input: func(c *Config) {
+				v := -1
+				c.Agent.Experimental.RateLimit.FetchWITBundles = &v
 			},
 			test: func(t *testing.T, ac *agent.Config) {
 				require.Nil(t, ac)
@@ -1496,6 +1913,42 @@ func TestNewAgentConfig(t *testing.T) {
 				require.Nil(t, ac)
 			},
 		},
+		{
+			msg: "wit_svid_cache_max_size is configurable",
+			input: func(c *Config) {
+				c.Agent.Experimental.WITSVIDCacheMaxSize = 100
+			},
+			test: func(t *testing.T, ac *agent.Config) {
+				require.Equal(t, 100, ac.WITSVIDCacheMaxSize)
+			},
+		},
+		{
+			msg:                "wit_svid_cache_max_size negative value returns an error",
+			expectError:        true,
+			requireErrorPrefix: "experimental.wit_svid_cache_max_size should not be negative",
+			input: func(c *Config) {
+				c.Agent.Experimental.WITSVIDCacheMaxSize = -1
+			},
+			test: func(t *testing.T, ac *agent.Config) {
+				require.Nil(t, ac)
+			},
+		},
+		{
+			msg:   "WIT-SVIDs are disabled by default",
+			input: func(c *Config) {},
+			test: func(t *testing.T, ac *agent.Config) {
+				require.False(t, ac.EnableWITSVIDs)
+			},
+		},
+		{
+			msg: "enable_wit_svids enables WIT-SVIDs",
+			input: func(c *Config) {
+				c.Agent.Experimental.EnableWITSVIDs = true
+			},
+			test: func(t *testing.T, ac *agent.Config) {
+				require.True(t, ac.EnableWITSVIDs)
+			},
+		},
 	}
 	cases = append(cases, newAgentConfigCasesOS(t)...)
 	for _, testCase := range cases {
@@ -1504,6 +1957,10 @@ func TestNewAgentConfig(t *testing.T) {
 		testCase.input(input)
 
 		t.Run(testCase.msg, func(t *testing.T) {
+			for k, v := range testCase.env {
+				t.Setenv(k, v)
+			}
+
 			var logOpts []log.Option
 			if testCase.logOptions != nil {
 				logOpts = testCase.logOptions(t)
@@ -1522,6 +1979,56 @@ func TestNewAgentConfig(t *testing.T) {
 			testCase.test(t, ac)
 		})
 	}
+}
+
+func TestParseTLSConfigFromHCL(t *testing.T) {
+	const configString = `
+agent {
+    data_dir = "."
+    log_level = "INFO"
+    server_address = "127.0.0.1"
+    server_port = "8081"
+    trust_domain = "example.org"
+    insecure_bootstrap = true
+    tls_config {
+        min_tls_version = "VersionTLS13"
+        cipher_suites = [
+            "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+        ]
+        curve_preferences = [
+            "X25519MLKEM768",
+            "X25519",
+            "secp256r1",
+        ]
+    }
+    experimental {
+        require_pq_kem = true
+    }
+}
+plugins {}
+`
+	c := &Config{}
+	require.NoError(t, hcl.Decode(c, configString))
+
+	require.NotNil(t, c.Agent.TLSConfig)
+	require.Equal(t, "VersionTLS13", c.Agent.TLSConfig.MinTLSVersion)
+	require.Equal(t, []string{"TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256"}, c.Agent.TLSConfig.CipherSuites)
+	require.Equal(t, []string{"X25519MLKEM768", "X25519", "secp256r1"}, c.Agent.TLSConfig.CurvePreferences)
+	require.True(t, c.Agent.Experimental.RequirePQKEM)
+
+	valid := defaultValidConfig()
+	valid.Agent.InsecureBootstrap = true
+	valid.Agent.TrustBundlePath = ""
+	valid.Agent.TLSConfig = c.Agent.TLSConfig
+	valid.Agent.Experimental.RequirePQKEM = c.Agent.Experimental.RequirePQKEM
+
+	ac, err := NewAgentConfig(valid, nil, false)
+	require.NoError(t, err)
+	require.True(t, ac.TLSPolicy.RequirePQKEM)
+	require.NotNil(t, ac.TLSPolicy.TLSCfg)
+	require.Equal(t, uint16(tls.VersionTLS13), ac.TLSPolicy.TLSCfg.MinTLSVersion)
+	require.Nil(t, ac.TLSPolicy.TLSCfg.CipherSuites)
+	require.Equal(t, []tls.CurveID{tls.X25519MLKEM768, tls.X25519, tls.CurveP256}, ac.TLSPolicy.TLSCfg.CurvePreferences)
 }
 
 func TestParseBrokerAllowedReferenceTypes(t *testing.T) {
@@ -1704,6 +2211,16 @@ func TestWarnOnUnknownConfig(t *testing.T) {
 			expectedLogEntries: []logEntry{
 				{
 					section: "ratelimit",
+					keys:    "unknown_option1,unknown_option2",
+				},
+			},
+		},
+		{
+			msg:      "in nested log_file_rotation block",
+			confFile: "agent_bad_nested_log_file_rotation_block.conf",
+			expectedLogEntries: []logEntry{
+				{
+					section: "log_file_rotation",
 					keys:    "unknown_option1,unknown_option2",
 				},
 			},

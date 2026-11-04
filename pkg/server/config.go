@@ -31,6 +31,9 @@ type Config struct {
 	// If true enables audit logs
 	AuditLogEnabled bool
 
+	// AuditLogExcludeAgentSync omits successful agent sync reads from audit logs.
+	AuditLogExcludeAgentSync bool
+
 	// ProxyProtocolTrustedCIDRs is a list of trusted CIDRs for PROXY protocol.
 	// When non-empty, the server enables PROXY protocol on the TCP listener and
 	// restricts PROXY header acceptance to connections originating from these
@@ -71,6 +74,9 @@ type Config struct {
 
 	// JWTSVIDTTL is default time-to-live for SVIDs (overrides SVIDTTL)
 	JWTSVIDTTL time.Duration
+
+	// WITSVIDTTL is default time-to-live for WIT-SVIDs
+	WITSVIDTTL time.Duration
 
 	// CATTL is the time-to-live for the server CA. This only applies to
 	// self-signed CA certificates, otherwise it is up to the upstream CA.
@@ -163,6 +169,10 @@ type Config struct {
 type ExperimentalConfig struct {
 	// AgentSpiffeIdAsSelector, if true, includes the agent spiffe id as a node selector.
 	AgentSpiffeIdAsSelector bool
+
+	// AllowNonconformingAgentIDs, if true, allows node attestors to produce agent
+	// IDs outside of their reserved namespace.
+	AllowNonconformingAgentIDs bool
 }
 
 type FederationConfig struct {

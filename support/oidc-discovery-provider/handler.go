@@ -65,6 +65,7 @@ func NewHandler(log logrus.FieldLogger, domainPolicy DomainPolicy, source JWKSSo
 
 func (h *Handler) serveWellKnown(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "GET" {
+		w.Header().Set("Allow", http.MethodGet)
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
@@ -146,11 +147,13 @@ func (h *Handler) serveWellKnown(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
 	_, _ = w.Write(docBytes)
 }
 
 func (h *Handler) serveKeys(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "GET" {
+		w.Header().Set("Allow", http.MethodGet)
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
@@ -180,6 +183,7 @@ func (h *Handler) serveKeys(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Expires", "0")
 
 	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
 	http.ServeContent(w, r, "keys", modTime, bytes.NewReader(jwksBytes))
 }
 
